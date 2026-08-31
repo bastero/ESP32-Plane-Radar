@@ -24,8 +24,8 @@ constexpr unsigned long kWifiConnectingFrameMs = 50;
 constexpr unsigned long kWifiDownGraceMs = 4000;
 /** Minimum interval between background reconnect tries. */
 constexpr unsigned long kWifiReconnectIntervalMs = 15000;
-/** Amsterdam local time, matching the default radar location; includes DST. */
-constexpr char kLocalTimeZone[] = "CET-1CEST,M3.5.0,M10.5.0/3";
+/** America/Chicago (Prosper TX); includes DST. Compile-time only — not portal-settable. */
+constexpr char kLocalTimeZone[] = "CST6CDT,M3.2.0,M11.1.0";
 constexpr char kNtpServer[] = "pool.ntp.org";
 
 // --- BOOT button (ESP32-C3 Super Mini, active LOW) ---
@@ -41,6 +41,7 @@ constexpr int kDisplayPinCs = 15;
 constexpr int kDisplayPinDc = 2;
 constexpr int kDisplayPinMosi = 13;
 constexpr int kDisplayPinSclk = 14;
+constexpr int kDisplayBacklightPin = -1;  // NM-TV-154 drives BL via LovyanGFX Light
 #else
 // --- Display: GC9A01 1.28" round 240×240 (SPI) ---
 constexpr int kDisplayPinRst = GPIO_NUM_0;
@@ -48,6 +49,9 @@ constexpr int kDisplayPinCs = GPIO_NUM_1;
 constexpr int kDisplayPinDc = GPIO_NUM_10;
 constexpr int kDisplayPinMosi = GPIO_NUM_3;  // display SDA
 constexpr int kDisplayPinSclk = GPIO_NUM_4;  // display SCL
+// Backlight is NOT driven by the all-in-one build for the C3 Super Mini.
+// Drive it from a free GPIO so the panel isn't dark. Connect GC9A01 BL -> this pin.
+constexpr int kDisplayBacklightPin = GPIO_NUM_5;
 #endif
 
 constexpr int kDisplayWidth = 240;
@@ -63,9 +67,9 @@ constexpr bool kDisplayRgbOrder = false;
 constexpr bool kDisplayRgbOrder = true;
 #endif
 
-// --- Radar center defaults (overridden via WiFi setup portal) ---
-constexpr double kDefaultRadarLat = 52.3676;
-constexpr double kDefaultRadarLon = 4.9041;
+// --- Radar center defaults (Prosper TX — actual home coords; portal can override) ---
+constexpr double kDefaultRadarLat = 33.2011989;
+constexpr double kDefaultRadarLon = -96.9083990;
 
 /** Poll adsb.fi (API public limit: 1 req/s). */
 constexpr unsigned long kAdsbFetchIntervalMs = 3000;

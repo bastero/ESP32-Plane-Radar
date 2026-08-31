@@ -13,6 +13,7 @@ namespace ui::radar {
  *  10 km  — default; neighborhood spotting
  *  15 km  — wider local area
  *  25 km  — metro / regional picture
+ *  40 km  — regional + major-airport runways (DFW/DAL in view from Prosper)
  *
  * Outer radius (for aircraft math) is ring-3 distance ÷ 0.75.
  */
@@ -29,6 +30,7 @@ constexpr RangePreset kRangePresets[] = {
     {10.0f, 10.0f * kRing3ToOuterKm},
     {15.0f, 15.0f * kRing3ToOuterKm},
     {25.0f, 25.0f * kRing3ToOuterKm},
+    {40.0f, 40.0f * kRing3ToOuterKm},
 };
 
 constexpr size_t kRangePresetCount =

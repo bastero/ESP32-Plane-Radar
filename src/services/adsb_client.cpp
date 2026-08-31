@@ -30,7 +30,24 @@ Aircraft s_incoming[kMaxAircraft];
 Aircraft s_display[kMaxAircraft];
 size_t s_aircraft_count = 0;
 PollFn s_poll_fn = nullptr;
+// Failure backoff: after a failed fetch (TLS malloc failure, HTTP error,
+// parse error), skip further fetch attempts for this long. Without this, a
+// memory-exhausted TLS stack retries every ~130 ms (main loop delay(10) +
+// interval reset on failure) and hammers connect() forever.
+unsigned long s_last_fetch_failure_ms = 0;
+constexpr unsigned long kFetchFailureBackoffMs = 30000;
 portMUX_TYPE s_tracks_lock = portMUX_INITIALIZER_UNLOCKED;
+
+bool fetchOnBackoff(unsigned long now_ms) {
+  if (s_last_fetch_failure_ms == 0) {
+    return false;
+  }
+  return (now_ms - s_last_fetch_failure_ms) < kFetchFailureBackoffMs;
+}
+
+void markFetchFailure(unsigned long now_ms) {
+  s_last_fetch_failure_ms = now_ms;
+}
 
 int findTrackById(const char* id) {
   if (id == nullptr || id[0] == '\0') {
@@ -93,14 +110,17 @@ bool readResponseBodyWithPoll(HTTPClient& http, String& payload) {
     return false;
   }
 
-  const int content_length = http.getSize();
-  (void)content_length;
   payload.reserve(4096);
 
   uint8_t buffer[512];
   const unsigned long deadline = millis() + kRequestTimeoutMs;
+  // Truncation-proof read: do NOT break on `!http.connected() || available()<=0`
+  // — WiFiClientSecure can report disconnected/empty on a TLS record boundary
+  // while more data is still incoming (observed: reads stop at ~9.8 KB).
+  // Instead, read until the payload stops growing for a sustained silence gap.
+  unsigned long last_growth_ms = millis();
+  const unsigned long kSilenceMs = 500;
   while (millis() < deadline) {
-    pollNetwork();
     const int available = stream->available();
     if (available > 0) {
       const int to_read =
@@ -110,13 +130,14 @@ bool readResponseBodyWithPoll(HTTPClient& http, String& payload) {
       if (read_bytes > 0) {
         payload.concat(reinterpret_cast<const char*>(buffer),
                        static_cast<unsigned>(read_bytes));
+        last_growth_ms = millis();
+        continue;
       }
     }
-    if (content_length > 0 &&
-        static_cast<int>(payload.length()) >= content_length) {
-      break;
-    }
-    if (!http.connected() && stream->available() <= 0) {
+    // No bytes this tick. If the payload has been silent for the gap, the
+    // server has finished sending — stop. Otherwise keep waiting (TLS may
+    // buffer more).
+    if (payload.length() > 0 && millis() - last_growth_ms > kSilenceMs) {
       break;
     }
     delay(1);
@@ -268,6 +289,12 @@ const Aircraft* aircraftList(unsigned long now_ms, size_t* count) {
 }
 
 bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
+  const unsigned long now_ms = millis();
+  if (fetchOnBackoff(now_ms)) {
+    // Keep showing last known planes; don't hammer TLS while heap is tight.
+    return false;
+  }
+
   const float dist_nm = kmToNauticalMiles(fetch_radius_km);
 
   String url = kApiBase;
@@ -285,37 +312,76 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
     Serial.println("adsb: http.begin failed");
     return false;
   }
+  // Ask for plain JSON. Without this, adsb.fi/cloudflare may gzip the body and
+  // the uncompressed read would fail to parse (InvalidInput).
+  http.addHeader("Accept-Encoding", "identity");
+  // CRITICAL: HTTPClient sends "Accept-Encoding: identity;q=1,chunked;q=0.1,*;q=0"
+  // by default (lib source HTTPClient.cpp:1217), which lets Cloudflare answer
+  // chunked. The lib's chunked reader (writeToStream) is fragile over TLS and
+  // leaks chunk-size lines into the body / truncates. HTTP/1.0 responses use
+  // Content-Length identity encoding — no chunked — so force it. This
+  // eliminates the chunked framing bug entirely.
+  http.useHTTP10(true);
 
   http.setTimeout(kRequestTimeoutMs);
   const int code = performGetWithPoll(http);
   if (code != HTTP_CODE_OK) {
     Serial.printf("adsb: HTTP %d\n", code);
+    markFetchFailure(millis());
     http.end();
     return false;
   }
 
-  String payload;
-  if (!readResponseBodyWithPoll(http, payload)) {
+  // Use HTTPClient's own getString(): it decodes chunked Transfer-Encoding
+  // internally (consuming the "0\r\n\r\n" terminal) and respects the
+  // 10-second timeout. Hand-rolled stream reads over WiFiClientSecure
+  // truncate when TLS re-buffers pause > the silence window.
+  String payload = http.getString();
+  if (payload.length() == 0) {
     Serial.println("adsb: empty response");
+    markFetchFailure(millis());
     http.end();
     return false;
   }
   http.end();
 
   const size_t payload_len = payload.length();
+  // ArduinoJson needs a pool roughly 1.5-2x the input size (object/array
+  // overhead + string storage). Original code used payload_len*2 (up to 96 KB)
+  // which is the correct capacity — the actual failure was the missing backoff:
+  // after a fetch, heap fragmentation made the NEXT TLS handshake fail with
+  // -32512 (SSL memory), which retried every ~130 ms with no pause, keeping
+  // heap permanently fragmented. Backoff (kFetchFailureBackoffMs = 30 s) now
+  // prevents that storm, so restoring the *2 sizing is safe.
   size_t doc_capacity = payload_len * 2u;
-  if (doc_capacity < 24 * 1024) {
-    doc_capacity = 24 * 1024;
+  if (doc_capacity < 16 * 1024) {
+    doc_capacity = 16 * 1024;
   }
   if (doc_capacity > 96 * 1024) {
     doc_capacity = 96 * 1024;
   }
 
+  // Cloudflare / chunked Transfer-Encoding can leave framing residue on the
+  // body: a leading chunk-size marker ("8de2\r\n") before '{', and the
+  // terminal marker ("0\r\n\r\n") after the final '}'. The JSON itself is
+  // complete and valid between the first '{' and last '}'. Find both and pass
+  // a pointer+length view to ArduinoJson so it never sees the framing.
+  const int json_start = payload.indexOf('{');
+  const int json_end = payload.lastIndexOf('}');
+  const char* json_ptr = json_start < 0 ? payload.c_str() : payload.c_str() + json_start;
+  const size_t json_len =
+      (json_start < 0 || json_end < json_start) ? 0
+                                                : static_cast<size_t>(json_end - json_start + 1);
+
   DynamicJsonDocument doc(doc_capacity);
-  const DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    Serial.printf("adsb: JSON parse error: %s (payload=%u bytes)\n",
-                  err.c_str(), static_cast<unsigned>(payload_len));
+  const DeserializationError err =
+      deserializeJson(doc, json_ptr, json_len);
+  if (err && err != DeserializationError::NoMemory) {
+    Serial.printf("adsb: JSON parse error: %s (http_code=%d len=%u cap=%u head='%.*s' tail='%.*s')\n",
+                  err.c_str(), code, static_cast<unsigned>(json_len),
+                  static_cast<unsigned>(doc_capacity), json_len > 24 ? 24 : static_cast<int>(json_len),
+                  json_ptr, 20, json_ptr + (json_len > 20 ? json_len - 20 : 0));
+    markFetchFailure(millis());
     return false;
   }
 

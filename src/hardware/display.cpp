@@ -20,6 +20,14 @@ void displayInit() {
   tft.setRotation(0);
   tft.setBrightness(255);
   tft.setTextWrap(false);
+#ifndef BOARD_NM_TV_154
+  // The C3 Super Mini build has no LovyanGFX Light object; drive the panel
+  // backlight from a plain GPIO so the GC9A01 isn't dark. Connect BL -> this pin.
+  if (config::kDisplayBacklightPin >= 0) {
+    pinMode(static_cast<uint8_t>(config::kDisplayBacklightPin), OUTPUT);
+    digitalWrite(static_cast<uint8_t>(config::kDisplayBacklightPin), HIGH);
+  }
+#endif
 #ifdef BOARD_NM_TV_154
   Serial.println(
       "display: ST7789 240x240 mem=240x320 offset=(0,0) rotation=0 "
