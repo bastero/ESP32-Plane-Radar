@@ -97,7 +97,16 @@ float fetchRadiusKm() {
   const float outer_km = rangeCurrent().outer_km;
   const float screen_r_px =
       static_cast<float>(kCenterX - kBeyondRingScreenMarginPx);
-  return outer_km * (screen_r_px / static_cast<float>(kGridOuterRadius));
+  // Cap the fetch radius: opendata.adsb.fi returns EMPTY responses at wide
+  // radii under load (observed size=0 at dist 30-90 nm) and responses up to
+  // 75 KB at dist 120 nm — which overflows the C3's heap/TLS buffers and
+  // truncates. Planes beyond the screen edge are invisible anyway, so clamp
+  // to the 40 km preset's outer edge. NOTE: this value is in km; the API URL
+  // converts to nautical miles (fetchUpdate), so 53.3 km ≈ 28.8 nm — just
+  // under the 30 nm band where empties were observed.
+  const float kMaxFetchOuterKm = 40.0f * kRing3ToOuterKm;  // 53.3 km ≈ 28.8 nm
+  const float capped_outer_km = outer_km > kMaxFetchOuterKm ? kMaxFetchOuterKm : outer_km;
+  return capped_outer_km * (screen_r_px / static_cast<float>(kGridOuterRadius));
 }
 
 bool useMiles() { return s_use_miles; }

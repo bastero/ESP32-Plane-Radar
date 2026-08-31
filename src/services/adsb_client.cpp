@@ -376,7 +376,10 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   DynamicJsonDocument doc(doc_capacity);
   const DeserializationError err =
       deserializeJson(doc, json_ptr, json_len);
-  if (err && err != DeserializationError::NoMemory) {
+  // IncompleteInput (body truncated mid-array) and NoMemory (doc filled) are
+  // NOT corruption — the leading planes parsed are valid and useful. Only
+  // hard-fail on true corruption (InvalidInput = not JSON).
+  if (err == DeserializationError::InvalidInput) {
     Serial.printf("adsb: JSON parse error: %s (http_code=%d len=%u cap=%u head='%.*s' tail='%.*s')\n",
                   err.c_str(), code, static_cast<unsigned>(json_len),
                   static_cast<unsigned>(doc_capacity), json_len > 24 ? 24 : static_cast<int>(json_len),
