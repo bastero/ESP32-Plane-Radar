@@ -250,7 +250,12 @@ void drawLargeAirportRunways(lgfx::LGFXBase& gfx) {
     return;
   }
   displayFontEnsureLoaded(gfx);
-  const float radius_km = radar::fetchRadiusKm();
+  // Base the airport-visibility radius on the DISPLAYED range (the ring scale),
+  // not fetchRadiusKm(): the fetch radius is capped (~24 km) to keep ADS-B
+  // responses under the C3's TLS receive wall, but the radar ring still shows
+  // the full preset distance (e.g. 40 km), so airports inside the ring (DFW,
+  // DAL) must render even when they're beyond the fetch cap.
+  const float radius_km = radar::rangeCurrent().outer_km;
 
   uint16_t label_airports[kMaxAirportLabels];
   size_t label_count = 0;

@@ -97,14 +97,12 @@ float fetchRadiusKm() {
   const float outer_km = rangeCurrent().outer_km;
   const float screen_r_px =
       static_cast<float>(kCenterX - kBeyondRingScreenMarginPx);
-  // Cap the fetch radius: opendata.adsb.fi returns EMPTY responses at wide
-  // radii under load (observed size=0 at dist 30-90 nm) and responses up to
-  // 75 KB at dist 120 nm — which overflows the C3's heap/TLS buffers and
-  // truncates. Planes beyond the screen edge are invisible anyway, so clamp
-  // to the 40 km preset's outer edge. NOTE: this value is in km; the API URL
-  // converts to nautical miles (fetchUpdate), so 53.3 km ≈ 28.8 nm — just
-  // under the 30 nm band where empties were observed.
-  const float kMaxFetchOuterKm = 40.0f * kRing3ToOuterKm;  // 53.3 km ≈ 28.8 nm
+  // Cap the fetch radius so the response fits under the ESP32-C3 TLS receive
+  // wall (~9.5-10 KB body max). Measured: dist 14 nm = 7.2 KB (OK), dist 16
+  // nm = 11.3 KB (marginal), dist 18+ nm = truncated or empty. 13 nm (~24
+  // km) keeps every view stable and populated. Planes beyond the cap are
+  // simply not fetched (inner rings unaffected).
+  const float kMaxFetchOuterKm = 13.0f * 1.852f;  // 24.1 km ≈ 13 nm
   const float capped_outer_km = outer_km > kMaxFetchOuterKm ? kMaxFetchOuterKm : outer_km;
   return capped_outer_km * (screen_r_px / static_cast<float>(kGridOuterRadius));
 }

@@ -58,6 +58,18 @@ namespace {
 /** Separate from planeradar prefs (rangeInit) to avoid NVS handle conflicts. */
 constexpr char kWifiPrefsNamespace[] = "wifi";
 constexpr char kPrefsForcePortalKey[] = "portal";
+constexpr char kPrefsSsidKey[] = "ssid";
+constexpr char kPrefsPassKey[] = "pass";
+
+// Credentials are stored in our own NVS namespace, NOT in the ESP32's
+// esp_wifi STA config (WiFi.persistent). The esp_wifi NVS keys
+// (sta.ssid / sta.passwd) get cross-key corrupted on ESP32-C3 fresh
+// flashes (observed: prepended junk / wrong key frame after a portal
+// save), which makes WiFiManager read back a mangled password forever.
+// Storing in Preferences("wifi") avoids that path entirely; WiFi.begin()
+// is called from RAM every boot with WiFi.persistent(false).
+constexpr char kFallbackSsid[] = "ATT57gFsBA";
+constexpr char kFallbackPass[] = "596ynwb2zh#%";
 
 bool s_force_config_portal = false;
 WiFiManager s_wm;
@@ -69,6 +81,7 @@ void ensureWifiManager();
 void startLanWebPortal();
 void stopLanWebPortal();
 bool wifiLinkUp();
+void saveWifiCredentials(const String& ssid, const String& pass);
 
 constexpr int kCoordParamLen = 20;
 constexpr char kCoordInputAttrs[] =
@@ -160,6 +173,14 @@ void refreshPortalParamDefaults() {
 }
 
 void onPortalParamsSaved() {
+  // The portal just saved (or the SSID/pass form was submitted). WiFiManager
+  // keeps the raw values in s_wm.getWiFiSSID()/getWiFiPass(); store them in
+  // our own namespace so boot never reads the corruptable esp_wifi NVS keys.
+  if (s_wm.getWiFiSSID().length() > 0) {
+    saveWifiCredentials(s_wm.getWiFiSSID(), s_wm.getWiFiPass());
+  } else {
+    Serial.println("wifi: portal save with empty ssid, keeping previous");
+  }
   if (!services::location::saveFromStrings(s_param_lat.getValue(),
                                            s_param_lon.getValue())) {
     Serial.println("Invalid lat/lon in portal — keeping previous location");
@@ -238,17 +259,41 @@ bool consumeForceConfigPortal() {
 }
 
 bool storedWifiCredentials() {
-  wifi_mode_t mode = WIFI_MODE_NULL;
-  if (esp_wifi_get_mode(&mode) != ESP_OK || mode == WIFI_MODE_NULL) {
-    WiFi.mode(WIFI_STA);
-    delay(50);
-  }
-
-  wifi_config_t conf = {};
-  if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) {
+  // Check our own namespace first. Returns true only when the SSID is
+  // present AND the password key is present (both written atomically by
+  // saveWifiCredentials). A half-written pair counts as "no creds" so the
+  // fallback path is used instead of a corrupt join attempt.
+  Preferences prefs;
+  if (!prefs.begin(kWifiPrefsNamespace, true)) {
     return false;
   }
-  return conf.sta.ssid[0] != '\0';
+  const String ssid = prefs.getString(kPrefsSsidKey, "");
+  const bool has_pass = prefs.isKey(kPrefsPassKey);
+  prefs.end();
+  return ssid.length() > 0 && has_pass;
+}
+
+void saveWifiCredentials(const String& ssid, const String& pass) {
+  Preferences prefs;
+  if (!prefs.begin(kWifiPrefsNamespace, false)) {
+    Serial.println("wifi: failed to open prefs for save");
+    return;
+  }
+  prefs.putString(kPrefsSsidKey, ssid);
+  prefs.putString(kPrefsPassKey, pass);
+  prefs.end();
+  Serial.printf("wifi: saved credentials (ssid='%s', pass_len=%u)\n",
+                ssid.c_str(), static_cast<unsigned>(pass.length()));
+}
+
+void clearWifiCredentials() {
+  Preferences prefs;
+  if (!prefs.begin(kWifiPrefsNamespace, false)) {
+    return;
+  }
+  prefs.remove(kPrefsSsidKey);
+  prefs.remove(kPrefsPassKey);
+  prefs.end();
 }
 
 void eraseWifiCredentials() {
@@ -346,6 +391,10 @@ void prepareSta() {
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(WIFI_PS_NONE);
+  // Never persist the STA config to the esp_wifi NVS keys — that path is
+  // where the C3 corruption happens. Credentials come from our own
+  // Preferences namespace every boot.
+  WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
 }
 
@@ -377,6 +426,8 @@ bool tryConnectWithUi(const String& ssid, const String& pass, bool show_ui) {
   }
 
   const char* ui_ssid = ssid.length() > 0 ? ssid.c_str() : "network";
+  Serial.printf("wifi: trying ssid='%s' pass_len=%u\n", ui_ssid,
+                static_cast<unsigned>(pass.length()));
   if (show_ui) {
     statusScreenConnectingBegin(ui_ssid);
   }
@@ -395,23 +446,44 @@ bool tryConnectWithUi(const String& ssid, const String& pass, bool show_ui) {
     if (waitForLinkWithUi(ui_ssid, config::kWifiConnectAttemptMs)) {
       return true;
     }
+    // Log WHY the join failed: 1=no ssid found, 4=wrong password,
+    // 2=connection lost, 5=/6=other failures. This distinguishes a bad
+    // password from the router rejecting the device (client limit, MAC
+    // filter, band steering).
+    Serial.printf("wifi: join failed, WiFi.status()=%d\n",
+                  static_cast<int>(WiFi.status()));
   }
 
   return false;
 }
 
 bool connectSavedNetwork(bool show_ui) {
-  if (!storedWifiCredentials()) {
-    return false;
+  // Credentials live in our own Preferences namespace (see note at the
+  // top of this file). We never rely on the esp_wifi NVS STA config.
+  String ssid;
+  String pass;
+  if (storedWifiCredentials()) {
+    Preferences prefs;
+    if (prefs.begin(kWifiPrefsNamespace, true)) {
+      ssid = prefs.getString(kPrefsSsidKey, "");
+      pass = prefs.getString(kPrefsPassKey, "");
+      prefs.end();
+    }
   }
 
-  ensureWifiManager();
-  const String ssid = s_wm.getWiFiSSID();
   if (ssid.length() == 0) {
-    return false;
+    // Nothing saved: try the fallback directly so a fresh board joins the
+    // LAN without needing the portal at all.
+    return tryConnectWithUi(kFallbackSsid, kFallbackPass, show_ui);
   }
-  const String pass = s_wm.getWiFiPass();
-  return tryConnectWithUi(ssid, pass, show_ui);
+
+  if (tryConnectWithUi(ssid, pass, show_ui)) {
+    return true;
+  }
+  // Saved credentials failed (mangled by the portal or stale). Fall back to
+  // the known-good network.
+  Serial.println("wifi: saved creds failed, trying fallback network");
+  return tryConnectWithUi(kFallbackSsid, kFallbackPass, show_ui);
 }
 
 bool openConfigPortal() {
@@ -553,7 +625,7 @@ bool wifiSetupConnect() {
     return true;
   }
 
-  if (storedWifiCredentials() && connectSavedNetwork(true)) {
+  if (connectSavedNetwork(true)) {
     WiFi.setAutoReconnect(true);
     Serial.printf("Connected: %s  IP %s\n", WiFi.SSID().c_str(),
                   WiFi.localIP().toString().c_str());

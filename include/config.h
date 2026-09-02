@@ -12,7 +12,14 @@ constexpr char kFirmwareVersion[] = "v1.2.0";
 constexpr char kPortalApName[] = "PlaneRadar-Setup";
 constexpr char kPortalIp[] = "192.168.4.1";
 /** mDNS host (no ".local" suffix); browser: http://plane-radar.local */
+// Hostname is selectable at build time so a second unit on the same LAN
+// doesn't collide over mDNS. Build with -DPLANE_RADAR_UNIT_ONE to name it
+// "plane-radar-1" (first unit); the default stays "plane-radar".
+#ifdef PLANE_RADAR_UNIT_ONE
+constexpr char kPortalHostname[] = "plane-radar-1";
+#else
 constexpr char kPortalHostname[] = "plane-radar";
+#endif
 constexpr char kPortalHostUrl[] = "plane-radar.local";
 
 /** Per-attempt STA connect wait (ms); retried kWifiConnectAttempts times. */
@@ -72,7 +79,7 @@ constexpr double kDefaultRadarLat = 33.2011989;
 constexpr double kDefaultRadarLon = -96.9083990;
 
 /** Poll adsb.fi (API public limit: 1 req/s). */
-constexpr unsigned long kAdsbFetchIntervalMs = 3000;
+constexpr unsigned long kAdsbFetchIntervalMs = 15000;
 /** Legacy scale unused — fetch uses radar::fetchRadiusKm() to screen edge. */
 constexpr float kAdsbFetchRadiusScale = 1.0f;
 /** false = hide aircraft with alt_baro "ground"; true = show them too. */

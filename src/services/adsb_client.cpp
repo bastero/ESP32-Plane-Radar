@@ -20,7 +20,7 @@ namespace {
 constexpr char kApiBase[] = "https://opendata.adsb.fi/api/v3/lat/";
 constexpr float kKmPerNm = 1.852f;
 constexpr int kConnectAttemptMs = 200;
-constexpr unsigned long kRequestTimeoutMs = 10000;
+constexpr unsigned long kRequestTimeoutMs = 20000;
 
 using motion::AircraftTrack;
 
@@ -36,6 +36,12 @@ PollFn s_poll_fn = nullptr;
 // interval reset on failure) and hammers connect() forever.
 unsigned long s_last_fetch_failure_ms = 0;
 constexpr unsigned long kFetchFailureBackoffMs = 30000;
+// Track coast time: how long a previously-seen aircraft stays on screen after
+// its last contact. The ADS-B server/Cloudflare frequently truncates or empties
+// wide-radius responses, which used to make aircraft vanish and reappear every
+// fetch. Coasting keeps them displayed (position keeps extrapolating from last
+// known velocity) until they've been absent this long.
+constexpr unsigned long kTrackCoastMs = 45000;
 portMUX_TYPE s_tracks_lock = portMUX_INITIALIZER_UNLOCKED;
 
 bool fetchOnBackoff(unsigned long now_ms) {
@@ -64,19 +70,42 @@ int findTrackById(const char* id) {
 void replaceTracks(const Aircraft* incoming, size_t count,
                    unsigned long now_ms) {
   taskENTER_CRITICAL(&s_tracks_lock);
+
+  // Track which existing entries were refreshed this cycle, so stale ones can
+  // be coasted (kept on screen) instead of dropped.
+  bool refreshed[kMaxAircraft] = {false};
+
+  // 1. Update/create tracks from the incoming response.
+  size_t out = 0;
   for (size_t i = 0; i < count; ++i) {
     const int previous = motion::hasStableId(incoming[i])
                              ? findTrackById(incoming[i].id)
                              : -1;
-    s_next_tracks[i] = previous >= 0
-                           ? motion::updateTrack(s_tracks[previous], incoming[i],
-                                                 now_ms)
-                           : motion::makeInitialTrack(incoming[i], now_ms);
+    if (previous >= 0) {
+      refreshed[previous] = true;
+    }
+    s_next_tracks[out++] =
+        previous >= 0
+            ? motion::updateTrack(s_tracks[previous], incoming[i], now_ms)
+            : motion::makeInitialTrack(incoming[i], now_ms);
   }
-  for (size_t i = 0; i < count; ++i) {
+
+  // 2. Coast: carry over tracks that were refreshed recently but are missing
+  // from this response (truncated / empty / server flake). Their positions
+  // keep extrapolating from last known velocity until they've been absent
+  // longer than kTrackCoastMs. This stops the wide view from blanking out and
+  // re-populating every fetch.
+  for (size_t i = 0; i < s_aircraft_count && out < kMaxAircraft; ++i) {
+    if (!refreshed[i] && motion::hasStableId(s_tracks[i].aircraft) &&
+        motion::elapsedMs(now_ms, s_tracks[i].updated_ms) < kTrackCoastMs) {
+      s_next_tracks[out++] = s_tracks[i];
+    }
+  }
+
+  for (size_t i = 0; i < out; ++i) {
     s_tracks[i] = s_next_tracks[i];
   }
-  s_aircraft_count = count;
+  s_aircraft_count = out;
   taskEXIT_CRITICAL(&s_tracks_lock);
 }
 
@@ -89,14 +118,17 @@ void pollNetwork() {
 int performGetWithPoll(HTTPClient& http) {
   http.setConnectTimeout(kConnectAttemptMs);
   const unsigned long deadline = millis() + kRequestTimeoutMs;
-  while (millis() < deadline) {
+  int attempts = 0;
+  constexpr int kMaxConnectAttempts = 3;
+  while (millis() < deadline && attempts < kMaxConnectAttempts) {
+    ++attempts;
     pollNetwork();
     const int code = http.GET();
     if (code > 0) {
       return code;
     }
     if (code != HTTPC_ERROR_CONNECTION_REFUSED &&
-        code != HTTPC_ERROR_NOT_CONNECTED) {
+        code != HTTPC_ERROR_NOT_CONNECTED && code != -1) {
       return code;
     }
     delay(5);
@@ -111,36 +143,71 @@ bool readResponseBodyWithPoll(HTTPClient& http, String& payload) {
   }
 
   payload.reserve(4096);
-
-  uint8_t buffer[512];
   const unsigned long deadline = millis() + kRequestTimeoutMs;
-  // Truncation-proof read: do NOT break on `!http.connected() || available()<=0`
-  // — WiFiClientSecure can report disconnected/empty on a TLS record boundary
-  // while more data is still incoming (observed: reads stop at ~9.8 KB).
-  // Instead, read until the payload stops growing for a sustained silence gap.
-  unsigned long last_growth_ms = millis();
-  const unsigned long kSilenceMs = 500;
+
+  // Content-Length responses: read exactly getSize() bytes (definitive).
+  const int content_length = http.getSize();
+  if (content_length > 0) {
+    uint8_t buffer[512];
+    while (millis() < deadline &&
+           static_cast<int>(payload.length()) < content_length) {
+      pollNetwork();
+      const int available = stream->available();
+      if (available > 0) {
+        const int to_read =
+            available > static_cast<int>(sizeof(buffer)) ? static_cast<int>(sizeof(buffer))
+                                                         : available;
+        const int read_bytes = stream->readBytes(buffer, to_read);
+        if (read_bytes > 0) {
+          payload.concat(reinterpret_cast<const char*>(buffer),
+                         static_cast<unsigned>(read_bytes));
+        }
+      } else if (!http.connected()) {
+        break;
+      }
+      delay(1);
+    }
+    return payload.length() > 0;
+  }
+
+  // Chunked Transfer-Encoding (getSize() == -1 on HTTP/1.1). Decode chunks
+  // properly: read hex-size line -> that many bytes -> CRLF; stop at a
+  // zero-size chunk (the definitive end marker). No silence guessing.
   while (millis() < deadline) {
-    const int available = stream->available();
-    if (available > 0) {
+    pollNetwork();
+    const String size_line = stream->readStringUntil('\n');
+    if (size_line.length() == 0) {
+      if (!http.connected()) {
+        break;
+      }
+      delay(1);
+      continue;
+    }
+    const int chunk_size =
+        static_cast<int>(strtol(size_line.c_str(), nullptr, 16));
+    if (chunk_size == 0) {
+      break;  // terminal chunk
+    }
+    uint8_t buffer[512];
+    int remaining = chunk_size;
+    while (remaining > 0 && millis() < deadline) {
+      pollNetwork();
       const int to_read =
-          available > static_cast<int>(sizeof(buffer)) ? static_cast<int>(sizeof(buffer))
-                                                       : available;
+          remaining > static_cast<int>(sizeof(buffer)) ? static_cast<int>(sizeof(buffer))
+                                                       : remaining;
       const int read_bytes = stream->readBytes(buffer, to_read);
       if (read_bytes > 0) {
         payload.concat(reinterpret_cast<const char*>(buffer),
                        static_cast<unsigned>(read_bytes));
-        last_growth_ms = millis();
-        continue;
+        remaining -= read_bytes;
+      } else if (!http.connected()) {
+        break;
       }
+      delay(1);
     }
-    // No bytes this tick. If the payload has been silent for the gap, the
-    // server has finished sending — stop. Otherwise keep waiting (TLS may
-    // buffer more).
-    if (payload.length() > 0 && millis() - last_growth_ms > kSilenceMs) {
-      break;
-    }
-    delay(1);
+    // Consume the CRLF after each chunk (may be split across reads; tolerate
+    // failure via readStringUntil on the next iteration).
+    stream->readStringUntil('\n');
   }
 
   return payload.length() > 0;
@@ -304,92 +371,100 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   url += "/dist/";
   url += String(dist_nm, 1);
 
-  WiFiClientSecure client;
-  client.setInsecure();
+  // PERSISTENT TLS connection: build the client+HTTPClient ONCE and reuse
+  // across every fetch. Creating fresh objects per fetch re-handshakes TLS
+  // each time and leaks ~13 KB/cycle (observed heap 73740 -> 60016 -> 55992),
+  // until the next handshake fails with -32512 (SSL malloc). One connection,
+  // one handshake, HTTP/1.1 keep-alive, zero accumulation.
+  static WiFiClientSecure client;
+  static HTTPClient http;
+  static bool s_client_ready = false;
+  if (!s_client_ready) {
+    client.setInsecure();
+    http.setReuse(true);  // keep the TLS socket open between fetches
+    s_client_ready = true;
+  }
 
-  HTTPClient http;
   if (!http.begin(client, url)) {
     Serial.println("adsb: http.begin failed");
     return false;
   }
-  // Ask for plain JSON. Without this, adsb.fi/cloudflare may gzip the body and
-  // the uncompressed read would fail to parse (InvalidInput).
+  // Ask for plain JSON (avoids gzip; the chunked decoder handles the rest).
   http.addHeader("Accept-Encoding", "identity");
-  // CRITICAL: HTTPClient sends "Accept-Encoding: identity;q=1,chunked;q=0.1,*;q=0"
-  // by default (lib source HTTPClient.cpp:1217), which lets Cloudflare answer
-  // chunked. The lib's chunked reader (writeToStream) is fragile over TLS and
-  // leaks chunk-size lines into the body / truncates. HTTP/1.0 responses use
-  // Content-Length identity encoding — no chunked — so force it. This
-  // eliminates the chunked framing bug entirely.
-  http.useHTTP10(true);
 
   http.setTimeout(kRequestTimeoutMs);
   const int code = performGetWithPoll(http);
   if (code != HTTP_CODE_OK) {
     Serial.printf("adsb: HTTP %d\n", code);
     markFetchFailure(millis());
+    // Connection broken; tear down so the next cycle rebuilds it fresh.
     http.end();
+    client.stop();
+    s_client_ready = false;
     return false;
   }
 
-  // Use HTTPClient's own getString(): it decodes chunked Transfer-Encoding
-  // internally (consuming the "0\r\n\r\n" terminal) and respects the
-  // 10-second timeout. Hand-rolled stream reads over WiFiClientSecure
-  // truncate when TLS re-buffers pause > the silence window.
-  String payload = http.getString();
-  if (payload.length() == 0) {
-    Serial.println("adsb: empty response");
-    markFetchFailure(millis());
+  // Read the body: Content-Length or chunked-decoded, with pollNetwork() so
+  // large TLS bodies keep flowing. Returns the COMPLETE body (the old
+  // truncations were the TLS re-buffer pauses + missing chunked decoder).
+  String payload;
+  if (!readResponseBodyWithPoll(http, payload)) {
+    // Empty body (server flake / Cloudflare hiccup) is not a network failure -
+    // keep the last good frame and retry next cycle.
+    Serial.println("adsb: empty response - keeping last frame");
     http.end();
+    client.stop();
+    s_client_ready = false;
     return false;
   }
-  http.end();
+  // Keep the connection alive for the next fetch (do NOT end()).
 
-  const size_t payload_len = payload.length();
-  // ArduinoJson needs a pool roughly 1.5-2x the input size (object/array
-  // overhead + string storage). Original code used payload_len*2 (up to 96 KB)
-  // which is the correct capacity — the actual failure was the missing backoff:
-  // after a fetch, heap fragmentation made the NEXT TLS handshake fail with
-  // -32512 (SSL memory), which retried every ~130 ms with no pause, keeping
-  // heap permanently fragmented. Backoff (kFetchFailureBackoffMs = 30 s) now
-  // prevents that storm, so restoring the *2 sizing is safe.
-  size_t doc_capacity = payload_len * 2u;
-  if (doc_capacity < 16 * 1024) {
-    doc_capacity = 16 * 1024;
-  }
-  if (doc_capacity > 96 * 1024) {
-    doc_capacity = 96 * 1024;
-  }
-
-  // Cloudflare / chunked Transfer-Encoding can leave framing residue on the
-  // body: a leading chunk-size marker ("8de2\r\n") before '{', and the
-  // terminal marker ("0\r\n\r\n") after the final '}'. The JSON itself is
-  // complete and valid between the first '{' and last '}'. Find both and pass
-  // a pointer+length view to ArduinoJson so it never sees the framing.
+  // Parse the JSON window between the first '{' and last '}'. The raw body
+  // from the reader is clean JSON (Cloudflare's chunked framing is decoded by
+  // the TLS/read layer); do NOT mutate the String in place — Arduino String
+  // operator[] is not guaranteed writable, and memmove into it corrupted the
+  // buffer (InvalidInput on valid JSON). No extra RAM, no copying.
   const int json_start = payload.indexOf('{');
   const int json_end = payload.lastIndexOf('}');
   const char* json_ptr = json_start < 0 ? payload.c_str() : payload.c_str() + json_start;
   const size_t json_len =
-      (json_start < 0 || json_end < json_start) ? 0
-                                                : static_cast<size_t>(json_end - json_start + 1);
+      (json_start < 0 || json_end < json_start)
+          ? 0
+          : static_cast<size_t>(json_end - json_start + 1);
 
-  DynamicJsonDocument doc(doc_capacity);
+  // Use a fixed-size static JSON document. A `static DynamicJsonDocument`
+  // inside this function still heap-allocates its 16 KB on FIRST use — which
+  // is right in the middle of fetch 1, fragmenting the heap before fetch 2's
+  // TLS handshake (observed: -32512 after the first successful fetch). A
+  // namespace-scope StaticJsonDocument lives in BSS (allocated at boot,
+  // zero heap cost, never fragments). 8 KB fits the ~7 KB capped-radius
+  // payload; aircraft beyond capacity are not rendered.
+  static StaticJsonDocument<8 * 1024> doc;
   const DeserializationError err =
       deserializeJson(doc, json_ptr, json_len);
-  // IncompleteInput (body truncated mid-array) and NoMemory (doc filled) are
-  // NOT corruption — the leading planes parsed are valid and useful. Only
-  // hard-fail on true corruption (InvalidInput = not JSON).
-  if (err == DeserializationError::InvalidInput) {
-    Serial.printf("adsb: JSON parse error: %s (http_code=%d len=%u cap=%u head='%.*s' tail='%.*s')\n",
-                  err.c_str(), code, static_cast<unsigned>(json_len),
-                  static_cast<unsigned>(doc_capacity), json_len > 24 ? 24 : static_cast<int>(json_len),
-                  json_ptr, 20, json_ptr + (json_len > 20 ? json_len - 20 : 0));
-    markFetchFailure(millis());
+  // Only a COMPLETE, valid response updates the display. Anything else
+  // (EmptyInput, IncompleteInput, InvalidInput, NoMemory) means the server
+  // hiccuped or truncated mid-body — swapping in a partial subset made the
+  // wide view erratic (planes randomly appearing/disappearing each 3 s fetch).
+  // Keep the last good frame instead; it stays stable until a full response
+  // arrives.
+  if (err != DeserializationError::Ok) {
+    // Truncated/incomplete is NOT a network failure — keep the last good frame
+    // and retry on the next fetch cycle (no backoff), so the wide view stays
+    // stable but still refreshes whenever a complete response arrives.
+    Serial.printf("adsb: fetch incomplete (%s) - len=%u head='%.*s' tail='%.*s'\n",
+                  err.c_str(), static_cast<unsigned>(json_len), json_len > 24 ? 24 : static_cast<int>(json_len),
+                  json_ptr, 28,
+                  json_ptr + (json_len > 28 ? json_len - 28 : 0));
     return false;
   }
 
   JsonArray ac = doc["ac"].as<JsonArray>();
   if (ac.isNull()) {
+    // Complete, valid response with no "ac" key / empty array. With track
+    // coasting this does NOT wipe the screen — existing tracks stay displayed
+    // (extrapolated) until they've been absent for kTrackCoastMs. A
+    // server-flaked empty response no longer blanks the radar.
     replaceTracks(nullptr, 0, millis());
     return true;
   }
