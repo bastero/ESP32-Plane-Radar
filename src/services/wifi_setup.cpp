@@ -68,8 +68,6 @@ constexpr char kPrefsPassKey[] = "pass";
 // save), which makes WiFiManager read back a mangled password forever.
 // Storing in Preferences("wifi") avoids that path entirely; WiFi.begin()
 // is called from RAM every boot with WiFi.persistent(false).
-constexpr char kFallbackSsid[] = "ATT57gFsBA";
-constexpr char kFallbackPass[] = "596ynwb2zh#%";
 
 bool s_force_config_portal = false;
 WiFiManager s_wm;
@@ -472,18 +470,21 @@ bool connectSavedNetwork(bool show_ui) {
   }
 
   if (ssid.length() == 0) {
-    // Nothing saved: try the fallback directly so a fresh board joins the
-    // LAN without needing the portal at all.
-    return tryConnectWithUi(kFallbackSsid, kFallbackPass, show_ui);
+    // Nothing saved in our namespace: return false. The caller either opens
+    // the setup portal or (in the original WiFiManager flow) falls back to
+    // WiFi-manager's own saved config. We do not hardcode any network here
+    // so the firmware ships with no credentials baked in.
+    return false;
   }
 
   if (tryConnectWithUi(ssid, pass, show_ui)) {
     return true;
   }
-  // Saved credentials failed (mangled by the portal or stale). Fall back to
-  // the known-good network.
-  Serial.println("wifi: saved creds failed, trying fallback network");
-  return tryConnectWithUi(kFallbackSsid, kFallbackPass, show_ui);
+  // Saved credentials failed. Return false so the caller opens the setup
+  // portal (fresh/clean entry path) instead of trying a hidden hardcoded
+  // network.
+  Serial.println("wifi: saved creds failed");
+  return false;
 }
 
 bool openConfigPortal() {
